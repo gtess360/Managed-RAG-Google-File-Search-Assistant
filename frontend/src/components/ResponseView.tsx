@@ -67,10 +67,10 @@ export const ResponseView: React.FC<ResponseViewProps> = ({
           <span className="meta-chip" title="Total Roundtrip Latency">
             ⏱ {response.timings.total_ms.toFixed(0)} ms total
           </span>
-          <span className="meta-chip" title="Chroma Vector Retrieval Latency">
+          <span className="meta-chip" title="File Search Retrieval Latency">
             🔍 {response.timings.retrieval_ms.toFixed(0)} ms retrieval
           </span>
-          <span className="meta-chip" title="OpenAI LLM Generation Latency">
+          <span className="meta-chip" title="Gemini LLM Generation Latency">
             🤖 {response.timings.generation_ms.toFixed(0)} ms generation
           </span>
           <span className="meta-chip" title="Model Identifier" data-testid="model-badge">

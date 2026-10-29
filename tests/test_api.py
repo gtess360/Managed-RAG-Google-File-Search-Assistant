@@ -1,7 +1,7 @@
 """Unit tests for the FastAPI backend (Phase 5A).
 
 Tests all endpoints using FastAPI's TestClient with a mocked pipeline.
-Ensures no paid OpenAI API calls or live network operations occur.
+Ensures no paid Gemini API calls or live network operations occur.
 """
 
 from unittest.mock import patch, MagicMock
@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from src.api import app
-from src.generation import (
+from src.file_search import (
     INSUFFICIENT_EVIDENCE_PHRASE,
     CITATION_VALIDITY_DISCLAIMER,
 )
@@ -51,7 +51,7 @@ def sample_pipeline_result() -> dict:
             "generation_ms": 320.4,
             "total_ms": 335.6,
         },
-        "model": "gpt-4o-mini",
+        "model": "gemini-2.5-flash",
         "error": None,
     }
 
@@ -286,46 +286,34 @@ def test_cors_rejects_unauthorized_origin(client):
 # -----------------------------------------------------------------------------
 
 def test_readiness_check_returns_200_when_ready(client):
-    """GET /ready returns 200 when index has chunks and OpenAI API key is present."""
-    mock_collection = MagicMock()
-    mock_collection.count.return_value = 4
-    mock_chroma_client = MagicMock()
-    mock_chroma_client.get_collection.return_value = mock_collection
-
-    with patch("src.api.has_openai_api_key", return_value=True), \
-         patch("src.vector_store.check_index_compatibility", return_value=(True, "Compatible")), \
-         patch("src.vector_store._get_client", return_value=mock_chroma_client):
+    """GET /ready returns 200 when the store has documents and the Gemini key is present."""
+    with patch("src.api.has_gemini_api_key", return_value=True), \
+         patch("src.api.get_store_status", return_value=(True, "ready", 4)):
         response = client.get("/ready")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ready"
         assert data["document_chunks"] == 4
-        assert data["openai_key_configured"] is True
+        assert data["gemini_key_configured"] is True
 
 
 def test_readiness_check_returns_503_when_no_api_key(client):
-    """GET /ready returns 503 when OPENAI_API_KEY is missing."""
-    with patch("src.api.has_openai_api_key", return_value=False):
+    """GET /ready returns 503 when GEMINI_API_KEY is missing."""
+    with patch("src.api.has_gemini_api_key", return_value=False):
         response = client.get("/ready")
         assert response.status_code == 503
         data = response.json()
-        assert "OPENAI_API_KEY" in data["detail"]
+        assert "GEMINI_API_KEY" in data["detail"]
 
 
-def test_readiness_check_returns_503_when_index_is_empty(client):
-    """GET /ready returns 503 when index contains 0 chunks."""
-    mock_collection = MagicMock()
-    mock_collection.count.return_value = 0
-    mock_chroma_client = MagicMock()
-    mock_chroma_client.get_collection.return_value = mock_collection
-
-    with patch("src.api.has_openai_api_key", return_value=True), \
-         patch("src.vector_store.check_index_compatibility", return_value=(True, "Compatible")), \
-         patch("src.vector_store._get_client", return_value=mock_chroma_client):
+def test_readiness_check_returns_503_when_store_is_empty(client):
+    """GET /ready returns 503 when the File Search store has no active documents."""
+    with patch("src.api.has_gemini_api_key", return_value=True), \
+         patch("src.api.get_store_status", return_value=(False, "store has no active documents", 0)):
         response = client.get("/ready")
         assert response.status_code == 503
         data = response.json()
-        assert "0 chunks" in data["detail"]
+        assert "no active documents" in data["detail"]
 
 
 # -----------------------------------------------------------------------------

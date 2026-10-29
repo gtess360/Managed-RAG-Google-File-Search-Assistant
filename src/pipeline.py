@@ -1,51 +1,66 @@
 """End-to-end RAG query pipeline for the Personal AI Knowledge Assistant.
 
-Coordinates question retrieval and evidence-grounded answer generation:
-1. Validates user question string.
-2. Embeds query and retrieves ranked evidence chunks from persistent Chroma storage.
-3. Formats candidate evidence as untrusted reference material.
-4. Generates an evidence-grounded answer with citations or explicit abstention via OpenAI.
-5. Resolves citations strictly to stored metadata (never trusting LLM source paths).
-6. Captures separate retrieval and generation latency timings.
-7. Keeps similarity metrics labeled strictly as 'distance' (never confidence or probability).
-8. Returns a clean structured dictionary consumable by both CLI and Streamlit UI.
+Powered by the Google Gemini API File Search tool, which performs chunking, embedding,
+retrieval and grounded generation server-side:
+1. Validates the user question string.
+2. Sends it to Gemini with the managed File Search store attached.
+3. Maps grounding metadata to citations and retrieved evidence (never trusting
+   model-invented source paths).
+4. Returns answered / partial / conflict / abstain / error with explicit abstention
+   when evidence is insufficient.
+5. Returns a clean structured dictionary consumable by the CLI, FastAPI and Streamlit.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Optional
+from typing import Any, Optional
 from pathlib import Path
-from openai import OpenAI
 
-from src.retrieval import retrieve, validate_query
-from src.generation import (
-    generate_answer,
+from src.file_search import (
+    ask,
     INSUFFICIENT_EVIDENCE_PHRASE,
     CITATION_VALIDITY_DISCLAIMER,
 )
-from src.config import OPENAI_MODEL, DEFAULT_TOP_K
+from src.config import (
+    DEFAULT_TOP_K,
+    GEMINI_MODEL,
+    GEMINI_TIMEOUT_SECONDS,
+    get_gemini_timeout_seconds,
+)
+
+MAX_QUESTION_CHARS = 500
+
+
+def validate_query(question: str) -> str:
+    """Return the stripped question or raise ValueError if empty or too long."""
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Question cannot be empty or whitespace only.")
+    cleaned = question.strip()
+    if len(cleaned) > MAX_QUESTION_CHARS:
+        raise ValueError(f"Question exceeds the {MAX_QUESTION_CHARS}-character limit.")
+    return cleaned
 
 
 def query_pipeline(
     question: str,
     top_k: int = DEFAULT_TOP_K,
-    storage_dir: Optional[Path] = None,
-    client: Optional[OpenAI] = None,
+    storage_dir: Optional[Path] = None,  # kept for backward compatibility; unused
+    client: Optional[Any] = None,
     model: Optional[str] = None,
-    timeout: float = 30.0,
-    max_retries: int = 2,
+    timeout: Optional[float] = None,
+    max_retries: int = 2,  # kept for backward compatibility; unused
 ) -> dict:
-    """Execute the full RAG pipeline: retrieval followed by evidence-grounded generation.
+    """Execute the RAG pipeline via Gemini File Search.
 
     Args:
         question: User query string.
-        top_k: Number of evidence chunks to retrieve (default DEFAULT_TOP_K).
-        storage_dir: Optional directory override for persistent Chroma index.
-        client: Optional OpenAI client instance (e.g. for offline mocking).
-        model: Optional OpenAI model identifier override.
-        timeout: Finite network request timeout in seconds (default 30.0).
-        max_retries: Maximum number of SDK retries on transient errors (default 2).
+        top_k: Number of evidence chunks File Search should retrieve.
+        storage_dir: Deprecated (local Chroma storage was removed); ignored.
+        client: Optional google-genai client (e.g. for offline mocking).
+        model: Optional Gemini model identifier override.
+        timeout: Request timeout in seconds (defaults to GEMINI_TIMEOUT_SECONDS or 120s).
+        max_retries: Deprecated; ignored.
 
     Returns:
         Structured result dictionary:
@@ -53,113 +68,51 @@ def query_pipeline(
             answer: str
             status: "answered" | "abstain" | "partial" | "conflict" | "error"
             missing_information: Optional[str]
-            citations: list[dict] (chunk_id, source, page resolved from storage)
-            invalid_citations: list[str] (unrecognized IDs filtered out)
+            citations: list[dict] (chunk_id, source, page from grounding metadata)
+            invalid_citations: list[str]
             citation_disclaimer: str
-            retrieved_evidence: list[dict] with distance, text, source, page
+            retrieved_evidence: list[dict] (distance is always None for File Search)
             timings: dict with retrieval_ms, generation_ms, total_ms
             model: str
             error: Optional[str]
     """
     t0 = time.perf_counter()
-    target_model = (model or OPENAI_MODEL).strip()
+    target_model = (model or GEMINI_MODEL).strip()
 
-    # 1. Validate query string
     try:
         clean_question = validate_query(question)
     except ValueError as e:
         total_ms = (time.perf_counter() - t0) * 1000.0
         return {
             "question": question,
-            "answer": INSUFFICIENT_EVIDENCE_PHRASE,
+            "answer": "",
             "status": "error",
             "missing_information": None,
             "citations": [],
             "invalid_citations": [],
-            "citation_disclaimer": CITATION_VALIDITY_DISCLAIMER,
+            "citation_disclaimer": "",
             "retrieved_evidence": [],
-            "timings": {
-                "retrieval_ms": 0.0,
-                "generation_ms": 0.0,
-                "total_ms": round(total_ms, 2),
-            },
+            "timings": {"retrieval_ms": 0.0, "generation_ms": 0.0, "total_ms": round(total_ms, 2)},
             "model": target_model,
             "error": str(e),
-        }
-
-    # 2. Retrieval step
-    t_retrieval_start = time.perf_counter()
-    try:
-        passages = retrieve(
-            question=clean_question,
-            top_k=top_k,
-            storage_dir=storage_dir,
-        )
-    except Exception as e:
-        retrieval_ms = (time.perf_counter() - t_retrieval_start) * 1000.0
-        total_ms = (time.perf_counter() - t0) * 1000.0
-        return {
-            "question": clean_question,
-            "answer": INSUFFICIENT_EVIDENCE_PHRASE,
-            "status": "error",
-            "missing_information": None,
-            "citations": [],
-            "invalid_citations": [],
-            "citation_disclaimer": CITATION_VALIDITY_DISCLAIMER,
-            "retrieved_evidence": [],
-            "timings": {
-                "retrieval_ms": round(retrieval_ms, 2),
-                "generation_ms": 0.0,
-                "total_ms": round(total_ms, 2),
+            "error_details": {
+                "exception_type": "ValueError",
+                "code": 400,
+                "model": target_model,
+                "sanitized_reason": str(e),
+                "summary": "Validation error: invalid question input.",
             },
-            "model": target_model,
-            "error": f"Retrieval failed: {str(e)}",
         }
-    retrieval_ms = (time.perf_counter() - t_retrieval_start) * 1000.0
 
-    # 3. Generation step
-    t_gen_start = time.perf_counter()
-    gen_result = generate_answer(
+    target_timeout = timeout if timeout is not None else get_gemini_timeout_seconds()
+
+    return ask(
         question=clean_question,
-        passages=passages,
-        client=client,
+        top_k=top_k,
         model=target_model,
-        timeout=timeout,
-        max_retries=max_retries,
+        client=client,
+        timeout=target_timeout,
     )
-    generation_ms = (time.perf_counter() - t_gen_start) * 1000.0
-    total_ms = (time.perf_counter() - t0) * 1000.0
-
-    # 4. Format evidence with explicit distance labeling (never confidence)
-    formatted_evidence = [
-        {
-            "chunk_id": p.get("chunk_id", ""),
-            "text": p.get("text", ""),
-            "source": p.get("source", ""),
-            "page": p.get("page"),
-            "chunk_index": p.get("chunk_index"),
-            "distance": p.get("distance"),  # Cosine distance: smaller means more similar
-        }
-        for p in passages
-    ]
-
-    return {
-        "question": clean_question,
-        "answer": gen_result["answer"],
-        "status": gen_result["status"],
-        "missing_information": gen_result.get("missing_information"),
-        "citations": gen_result["citations"],
-        "invalid_citations": gen_result["invalid_citations"],
-        "citation_disclaimer": CITATION_VALIDITY_DISCLAIMER,
-        "retrieved_evidence": formatted_evidence,
-        "timings": {
-            "retrieval_ms": round(retrieval_ms, 2),
-            "generation_ms": round(generation_ms, 2),
-            "total_ms": round(total_ms, 2),
-        },
-        "model": gen_result["model"],
-        "error": gen_result.get("error"),
-    }
 
 
 def main() -> None:

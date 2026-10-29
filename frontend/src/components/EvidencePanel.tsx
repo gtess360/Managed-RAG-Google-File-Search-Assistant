@@ -109,7 +109,7 @@ export const EvidencePanel: React.FC<EvidencePanelProps> = ({
 
                 <div
                   className="distance-badge"
-                  title="Chroma raw cosine distance"
+                  title="Relevance distance metric"
                   data-testid={`dist-${item.chunk_id}`}
                 >
                   <span>Cosine Distance: </span>

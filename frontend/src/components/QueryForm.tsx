@@ -156,7 +156,7 @@ export const QueryForm: React.FC<QueryFormProps> = ({
           >
             <span className="status-dot online" style={{ width: "6px", height: "6px" }} />
             <span>
-              Searching Chroma vector store and generating grounded answer with OpenAI gpt-4o-mini... (typically 5–15s)
+              Searching File Search store and generating grounded answer with Gemini... (typically 2–5s)
             </span>
           </div>
         )}

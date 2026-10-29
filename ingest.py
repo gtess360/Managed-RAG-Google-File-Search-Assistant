@@ -1,31 +1,19 @@
 r"""Corpus ingestion script for the Personal AI Knowledge Assistant.
 
-Reads all supported documents from data/documents/, chunks them using the
-documented word-based settings, computes embeddings with all-MiniLM-L6-v2,
-and writes a persistent ChromaDB index to storage/chroma.
+Uploads all supported documents from data/documents/ into a Google Gemini
+File Search store. Google handles chunking, embedding and indexing server-side.
 
 Usage:
-    .\.venv\Scripts\python.exe ingest.py                  # Use defaults
-    .\.venv\Scripts\python.exe ingest.py --force-rebuild  # Rebuild even if compatible
+    .\.venv\Scripts\python.exe ingest.py                 # Mirror local docs into the store
+    .\.venv\Scripts\python.exe ingest.py --no-replace    # Append without clearing the store
+    .\.venv\Scripts\python.exe ingest.py --allow-partial-ingestion
 
-FIRST-RUN NOTE
---------------
-On the first run (and any time the model cache is empty), sentence-transformers
-will download the 'all-MiniLM-L6-v2' model weights from the Hugging Face Hub
-(~90 MB). The download happens automatically to:
-    Windows: %USERPROFILE%\.cache\torch\sentence_transformers
-After the first run, the weights are cached locally and no download occurs.
-You can pre-set SENTENCE_TRANSFORMERS_HOME to a custom cache directory.
+Requires GEMINI_API_KEY in the environment or root .env file.
 
 POLICY
 ------
-This script performs a FULL REBUILD every run:
-- Reads fresh from data/documents/
-- Deletes the old collection before writing the new one
-- Checks embedding model compatibility before overwriting
-
+By default every run REPLACES the store contents so the store mirrors the local corpus.
 Do NOT run this script as part of the test suite.
-Tests create their own temporary indices using controlled fixtures.
 """
 
 import argparse
@@ -37,164 +25,107 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import PATHS
-from src.chunking import DEFAULT_CHUNK_OVERLAP, DEFAULT_CHUNK_SIZE, chunk_documents
-from src.embeddings import EMBEDDING_MODEL_NAME, embed_texts
-from src.loaders import load_documents_dir
-from src.vector_store import (
-    COLLECTION_NAME,
-    _get_client,
-    build_index,
-    check_index_compatibility,
-)
+from src.file_search import list_local_documents, sync_documents
 
 
 def ingest_corpus(
-    force_rebuild: bool = False,
+    create_store: bool = False,
+    replace: bool = False,
+    dry_run: bool = False,
     allow_partial_ingestion: bool = False,
-    allow_empty: bool = False,
     data_dir: Optional[Path] = None,
-    storage_dir: Optional[Path] = None,
+    storage_dir: Optional[Path] = None,  # deprecated, ignored
+    force_rebuild: bool = False,  # deprecated, ignored
+    allow_empty: bool = False,  # deprecated, ignored
 ) -> dict:
-    """Run the 5-step corpus ingestion pipeline.
+    """Upload the local corpus to the Gemini File Search store safely.
+
+    Guarantees:
+    1. Synchronization is NON-DESTRUCTIVE by default (replace=False).
+    2. Does NOT delete existing store documents before uploading; existing indexed documents
+       remain intact if an upload or indexing operation fails.
+    3. Handles duplicate and changed documents explicitly; reports planned changes.
+    4. Never treats partial ingestion as complete unless allow_partial_ingestion=True is set.
 
     Args:
-        force_rebuild: Rebuild even if existing index is incompatible.
-        allow_partial_ingestion: Proceed even if some files fail to load.
-        allow_empty: Allow replacing a non-empty index with an empty corpus.
+        create_store: Explicitly create a new store for this project if not already configured.
+        replace: Replace changed/duplicate documents (non-destructive by default).
+        dry_run: Inspect and report what would happen without modifying the store.
+        allow_partial_ingestion: Proceed even if some files fail to upload.
         data_dir: Directory to read documents from (defaults to PATHS.data_dir).
-        storage_dir: Directory to store ChromaDB index (defaults to PATHS.storage_dir).
+        storage_dir: Deprecated; ignored.
+        force_rebuild: Deprecated; ignored.
+        allow_empty: Deprecated; an empty corpus is always refused.
 
     Returns:
-        Summary dict of the built index.
+        Summary dict (store_name, display_name, uploaded, skipped, removed, failed, completed).
 
     Raises:
-        ValueError: If compatibility check fails or corpus is empty without permission.
-        RuntimeError: If file load errors occur without allow_partial_ingestion.
+        ValueError: If no supported documents are found, or no store is configured and create_store=False.
+        RuntimeError: If uploads fail without allow_partial_ingestion.
     """
     target_data_dir = data_dir or PATHS.data_dir
-    target_storage_dir = storage_dir or PATHS.storage_dir
 
     print("=" * 60)
-    print("Personal AI Knowledge Assistant — Corpus Ingestion")
+    print("Personal AI Knowledge Assistant — Gemini File Search Ingestion")
     print("=" * 60)
 
-    # 1. Compatibility check
-    compatible, compat_msg = check_index_compatibility(storage_dir=target_storage_dir)
-    print(f"\n[1/5] Index compatibility check: {compat_msg}")
-    if not compatible:
-        if not force_rebuild:
-            raise ValueError(
-                f"Existing index is incompatible: {compat_msg}. "
-                "Pass force_rebuild=True or --force-rebuild to rebuild."
-            )
-        print("[INFO] --force-rebuild specified; proceeding with rebuild.")
+    files = list_local_documents(target_data_dir)
+    print(f"\n[1/2] Found {len(files)} supported document(s) in: {target_data_dir}")
+    if not files:
+        raise ValueError("No documents were found and corpus is empty. Aborting.")
 
-    # 2. Load documents
-    print(f"\n[2/5] Loading documents from: {target_data_dir}")
-    load_result = load_documents_dir(target_data_dir)
-    records = load_result.records
-    errors = load_result.errors
-    warnings = load_result.warnings
+    mode_desc = "dry-run" if dry_run else ("replace" if replace else "non-destructive sync")
+    print(f"\n[2/2] Synchronizing with File Search store (mode={mode_desc}, create_store={create_store}) ...")
 
-    if warnings:
-        print(f"  Page-level warnings ({len(warnings)} skipped/textless page(s)):")
-        for warn in warnings:
-            print(f"    ~ {warn}")
+    summary = sync_documents(
+        data_dir=target_data_dir,
+        replace=replace,
+        create_store_if_missing=create_store,
+        allow_partial=allow_partial_ingestion,
+        dry_run=dry_run,
+    )
 
-    # Guard: Require explicit action before replacing nonempty index with empty corpus
-    if not records:
-        client = _get_client(target_storage_dir)
-        try:
-            coll = client.get_collection(COLLECTION_NAME)
-            existing_count = coll.count()
-        except Exception:
-            existing_count = 0
+    if summary.get("dry_run"):
+        print("\nDry-run complete. No changes were made to the remote store.")
+        return summary
 
-        if existing_count > 0 and not allow_empty:
-            raise RuntimeError(
-                f"Attempting to replace a non-empty index ({existing_count} chunks) "
-                "with an empty corpus! Refusing to wipe the existing index. "
-                "Pass --allow-empty to explicitly clear the index."
-            )
-        if not allow_empty:
-            raise ValueError("No documents were loaded and corpus is empty. Aborting.")
-
-        # If allow_empty is True, clear existing collection cleanly
-        try:
-            client.delete_collection(COLLECTION_NAME)
-        except Exception:
-            pass
-        return {
-            "collection": COLLECTION_NAME,
-            "chunk_count": 0,
-            "storage_dir": str(target_storage_dir),
-        }
-
-    if errors:
-        print(f"  File-loading errors ({len(errors)} file(s)):")
-        for err in errors:
-            print(f"    ! {err}")
+    if summary["failed"]:
+        print(f"\n  Upload/indexing failures ({len(summary['failed'])}):")
+        for item in summary["failed"]:
+            print(f"    ! {item}")
         if not allow_partial_ingestion:
             raise RuntimeError(
-                f"Loading produced {len(errors)} file-level failure(s). "
-                "Aborting rebuild to preserve the existing usable index. "
-                "Pass --allow-partial-ingestion to proceed with readable documents."
+                f"{len(summary['failed'])} file(s) failed to upload or index. "
+                "Previously indexed documents have been preserved. Partial ingestion is not complete. "
+                "Pass --allow-partial-ingestion to accept a partial index."
             )
-        print("  [WARN] --allow-partial-ingestion specified; proceeding with readable documents.")
 
-    print(f"  Loaded {len(records)} document record(s) (pages) from disk.")
-
-    # 3. Chunk documents
-    print(
-        f"\n[3/5] Chunking (chunk_size={DEFAULT_CHUNK_SIZE}, "
-        f"chunk_overlap={DEFAULT_CHUNK_OVERLAP}) ..."
-    )
-    chunks = chunk_documents(
-        records, chunk_size=DEFAULT_CHUNK_SIZE, chunk_overlap=DEFAULT_CHUNK_OVERLAP
-    )
-    print(f"  Produced {len(chunks)} chunk(s).")
-
-    # 4. Compute embeddings
-    print(f"\n[4/5] Computing embeddings with '{EMBEDDING_MODEL_NAME}' ...")
-    print(
-        "  NOTE: On first run, the model weights will be downloaded from "
-        "Hugging Face Hub (~90 MB)."
-    )
-    texts = [c.text for c in chunks]
-    embeddings = embed_texts(texts)
-    print(f"  Embedding array shape: {embeddings.shape}")
-
-    # 5. Build index (recoverable staged replacement)
-    print(f"\n[5/5] Writing ChromaDB collection '{COLLECTION_NAME}' to {target_storage_dir} ...")
-    summary = build_index(
-        chunks=chunks,
-        embeddings=embeddings,
-        chunk_size=DEFAULT_CHUNK_SIZE,
-        chunk_overlap=DEFAULT_CHUNK_OVERLAP,
-        storage_dir=target_storage_dir,
-    )
     print("\nIngestion complete.")
-    print(f"  Chunks indexed  : {summary['chunk_count']}")
-    print(f"  Embedding model : {summary['embedding_model']}")
-    print(f"  Embedding dim   : {summary['embedding_dimension']}")
-    print(f"  Normalized      : {summary['embedding_normalized']}")
-    print(f"  Distance metric : {summary['distance_metric']}")
-    print(f"  Chunk size      : {summary['chunk_size']}")
-    print(f"  Chunk overlap   : {summary['chunk_overlap']}")
-    print(f"  Storage path    : {summary['storage_dir']}")
-    print("\nThe index is ready. You can now run retrieval queries.")
+    print(f"  Store resource        : {summary['store_name']}")
+    print(f"  Display name          : {summary['display_name']}")
+    print(f"  Documents added/updated: {summary['uploaded']}")
+    print(f"  Documents skipped     : {summary['skipped']}")
+    print(f"  Documents removed     : {summary['removed']}")
+    print("\nThe store is ready. You can now run queries.")
     return summary
 
 
 def main(
-    force_rebuild: bool = False,
+    create_store: bool = False,
+    replace: bool = False,
+    dry_run: bool = False,
     allow_partial_ingestion: bool = False,
+    force_rebuild: bool = False,
     allow_empty: bool = False,
 ) -> None:
     try:
         ingest_corpus(
-            force_rebuild=force_rebuild,
+            create_store=create_store,
+            replace=replace,
+            dry_run=dry_run,
             allow_partial_ingestion=allow_partial_ingestion,
+            force_rebuild=force_rebuild,
             allow_empty=allow_empty,
         )
     except Exception as exc:
@@ -203,25 +134,53 @@ def main(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Ingest corpus into ChromaDB index.")
+    parser = argparse.ArgumentParser(
+        description="Synchronize local corpus with a Gemini File Search store safely."
+    )
     parser.add_argument(
-        "--force-rebuild",
+        "--create-store",
         action="store_true",
-        help="Rebuild even if an incompatible index already exists.",
+        help="Explicitly create a new File Search store for this project if not already configured.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace existing documents (default is non-destructive sync without deleting).",
+    )
+    parser.add_argument(
+        "--no-replace",
+        action="store_true",
+        help="Explicitly ensure no remote documents are replaced (default behavior).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Inspect local documents against the store and report planned actions without modifying anything.",
     )
     parser.add_argument(
         "--allow-partial-ingestion",
         action="store_true",
-        help="Proceed with ingestion even if some files fail to load.",
+        help="Proceed and accept store even if some files fail to upload.",
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Deprecated alias for --replace.",
     )
     parser.add_argument(
         "--allow-empty",
         action="store_true",
-        help="Allow replacing a non-empty index with an empty corpus.",
+        help="Deprecated; an empty corpus is always refused.",
     )
     args = parser.parse_args()
+
+    effective_replace = (args.replace or args.force_rebuild) and not args.no_replace
+
     main(
-        force_rebuild=args.force_rebuild,
+        create_store=args.create_store,
+        replace=effective_replace,
+        dry_run=args.dry_run,
         allow_partial_ingestion=args.allow_partial_ingestion,
+        force_rebuild=args.force_rebuild,
         allow_empty=args.allow_empty,
     )

@@ -42,12 +42,13 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from src.pipeline import query_pipeline
-from src.generation import (
+from src.file_search import (
     INSUFFICIENT_EVIDENCE_PHRASE,
     CITATION_VALIDITY_DISCLAIMER,
+    get_store_status,
     sanitize_error_message,
 )
-from src.config import OPENAI_MODEL, has_openai_api_key, APP_ENV, DEFAULT_TOP_K
+from src.config import GEMINI_MODEL, has_gemini_api_key, APP_ENV, DEFAULT_TOP_K
 
 
 # -----------------------------------------------------------------------------
@@ -289,13 +290,13 @@ class ReadyResponse(BaseModel):
     """Readiness probe response."""
     status: str = Field(..., description="Service readiness indicator ('ready' or 'unready')")
     service: str = Field(..., description="Service identifier")
-    document_chunks: int = Field(..., description="Number of indexed chunks in Chroma vector store")
-    model: str = Field(..., description="Configured OpenAI generation model")
-    openai_key_configured: bool = Field(
+    document_chunks: int = Field(..., description="Number of active documents in the Gemini File Search store")
+    model: str = Field(..., description="Configured Gemini generation model")
+    gemini_key_configured: bool = Field(
         ...,
         description=(
-            "Whether OPENAI_API_KEY is configured in the environment. Note: confirms key presence only; "
-            "does not guarantee valid credentials, active billing availability, or a successful model request."
+            "Whether GEMINI_API_KEY is configured in the environment. Note: confirms key presence only; "
+            "does not guarantee valid credentials, quota availability, or a successful model request."
         ),
     )
 
@@ -359,6 +360,7 @@ class QueryResponse(BaseModel):
     timings: TimingsItem
     model: str
     error: Optional[str] = None
+    error_details: Optional[dict] = None
 
 
 # -----------------------------------------------------------------------------
@@ -396,52 +398,40 @@ async def readiness_check() -> ReadyResponse:
     """Verify that the backend is initialized with an index and configured credentials.
 
     Checks:
-    1. Persistent Chroma vector index is accessible, compatible, and populated with >0 chunks.
-    2. OPENAI_API_KEY is non-empty and not the default placeholder.
+    1. GEMINI_API_KEY is non-empty and not the default placeholder.
+    2. The Gemini File Search store exists and has active documents.
 
     NOTE ON CREDENTIAL VALIDITY:
     A configured API key confirms presence in the environment only; it is NOT proof of
-    valid credentials, active billing availability, or a successful model request.
-    Checking live model requests belongs to integration testing, not a repeated readiness probe.
+    valid credentials, quota availability, or a successful model request.
 
     Returns HTTP 200 if ready; HTTP 503 if unready.
     """
-    if not has_openai_api_key():
+    if not has_gemini_api_key():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Service unready: OPENAI_API_KEY is not configured.",
+            detail="Service unready: GEMINI_API_KEY is not configured.",
         )
 
     try:
-        from src.vector_store import _get_client, COLLECTION_NAME, check_index_compatibility
-        compatible, compat_msg = check_index_compatibility()
-        if not compatible:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"Service unready: Vector index incompatible ({compat_msg}).",
-            )
-        client = _get_client()
-        collection = client.get_collection(COLLECTION_NAME)
-        count = collection.count()
-        if count == 0:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Service unready: Vector index exists but contains 0 chunks. Run ingest.py first.",
-            )
-    except HTTPException:
-        raise
+        ready, message, count = await run_in_threadpool(get_store_status)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Service unready: Unable to access vector index ({sanitize_error_message(str(e))}).",
+            detail=f"Service unready: Unable to access File Search store ({sanitize_error_message(str(e))}).",
+        )
+    if not ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Service unready: {message}",
         )
 
     return ReadyResponse(
         status="ready",
         service="personal-ai-knowledge-assistant",
         document_chunks=count,
-        model=OPENAI_MODEL,
-        openai_key_configured=True,
+        model=GEMINI_MODEL,
+        gemini_key_configured=True,
     )
 
 

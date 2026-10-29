@@ -147,7 +147,7 @@ export default function Home() {
               </h3>
               <p style={{ fontSize: "0.9rem", maxWidth: "520px", margin: "0 auto" }}>
                 Select a suggested question above or type your own question to retrieve candidate
-                chunks from persistent Chroma vector storage.
+                chunks using Google Gemini File Search.
               </p>
             </div>
           )}
@@ -157,7 +157,7 @@ export default function Home() {
       <footer className="footer">
         <div className="container">
           <p>
-            Personal AI Knowledge Assistant &bull; Next.js 16 + FastAPI + Chroma Vector Storage + OpenAI
+            Personal AI Knowledge Assistant &bull; Next.js 16 + FastAPI + Google Gemini File Search
           </p>
         </div>
       </footer>
