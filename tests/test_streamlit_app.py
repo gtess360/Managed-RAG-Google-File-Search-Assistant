@@ -432,6 +432,276 @@ def test_streamlit_initial_render(monkeypatch):
     assert at.session_state["last_result"] is None
 
 
+def test_phase1_dashboard_navbar_rendered(monkeypatch):
+    """Verify Phase 1 top SaaS navigation bar renders brand identity and status pill without utility links."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+    markdown_all = " ".join([m.value for m in at.markdown])
+
+    # 1. Navbar Brand Identity
+    assert "saas-top-navbar" in markdown_all
+    assert "saas-brand-logo" in markdown_all
+    assert "saas-brand-title" in markdown_all
+    assert "Personal AI Knowledge Assistant" in markdown_all
+    assert "Explore your documents" in markdown_all
+
+    # 2. Dynamic Live Status Pill
+    assert "saas-status-badge online" in markdown_all
+    assert "Online" in markdown_all
+
+    # 3. Feedback, Settings, and Help links are completely omitted
+    assert "Feedback" not in markdown_all
+    assert "Settings" not in markdown_all
+    assert "Help" not in markdown_all
+
+
+def test_phase1_dashboard_navbar_unhealthy_status(monkeypatch):
+    """Verify Phase 1 top SaaS navigation bar dynamically reflects offline status when store is unhealthy."""
+    monkeypatch.setenv("APP_ENV", "development")
+    with patch("src.file_search.get_store_status", return_value=(False, "Store not initialized", 0)):
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+        markdown_all = " ".join([m.value for m in at.markdown])
+        assert "saas-status-badge offline" in markdown_all
+        assert "Offline" in markdown_all
+
+
+def test_phase2_sidebar_new_conversation_clears_result_without_resetting_usage_or_auth(monkeypatch):
+    """Verify New Conversation button clears last_result and question_input while preserving quota and auth."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+    # Seed session state
+    at.session_state["last_result"] = {"question": "q", "answer": "a", "status": "answered"}
+    at.session_state["question_input"] = "seeded query"
+    at.session_state["questions_used"] = 3
+    at.session_state["authenticated"] = True
+    at.run()
+
+    # Click New Conversation button
+    new_conv_btns = [b for b in at.button if "New Conversation" in b.label]
+    assert len(new_conv_btns) == 1
+    new_conv_btns[0].click().run()
+
+    # Verify conversation is cleared
+    assert at.session_state["last_result"] is None
+    assert at.session_state["question_input"] == ""
+
+    # Verify quota and reviewer authorization are strictly preserved
+    assert at.session_state["questions_used"] == 3
+    assert at.session_state["authenticated"] is True
+
+
+def test_phase2_sidebar_documents_reflect_actual_directory(monkeypatch):
+    """Verify sidebar lists real documents from data/documents without hardcoded entries."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+    markdown_all = " ".join([m.value for m in at.markdown])
+
+    # Assert section header and total badge
+    assert "DOCUMENTS" in markdown_all
+    assert "sidebar-doc-badge" in markdown_all
+
+    # Assert the 4 actual real documents are rendered
+    assert "candidate_profile.md" in markdown_all
+    assert "project_aurora.md" in markdown_all
+    assert "project_beacon.md" in markdown_all
+    assert "project_nexus.md" in markdown_all
+
+
+def test_phase2_sidebar_demo_usage_progress_and_quota(monkeypatch):
+    """Verify sidebar demo usage card displays quota and progress bar correctly."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+    # Check unauthenticated state (0 questions used -> 5 remaining)
+    markdown_all = " ".join([m.value for m in at.markdown])
+    assert "Demo Usage" in markdown_all
+    assert "5 of 5 free questions remaining" in markdown_all
+    assert "sidebar-progress-track" in markdown_all
+
+    # When 2 questions are used (2 / 5 = 40%)
+    at.session_state["questions_used"] = 2
+    at.run()
+    markdown_all = " ".join([m.value for m in at.markdown])
+    assert "3 of 5 free questions remaining" in markdown_all
+    assert "width: 40%;" in markdown_all
+
+    # When reviewer authenticated
+    at.session_state["authenticated"] = True
+    at.run()
+    markdown_all = " ".join([m.value for m in at.markdown])
+    assert "Unlimited Access" in markdown_all
+
+
+def test_phase3_hero_and_suggested_questions(monkeypatch):
+    """Verify Phase 3 modern hero card and suggested question cards populate input without submitting."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+    markdown_all = " ".join([m.value for m in at.markdown])
+    assert "Ask your knowledge base" in markdown_all
+    assert "Document-powered AI" in markdown_all
+    assert "hero-illustration-box" in markdown_all
+
+    # Verify Aurora example button populates input
+    aurora_btn = [b for b in at.button if "Aurora" in b.label][0]
+    aurora_btn.click().run()
+    assert at.session_state["question_input"] == "Explain the infrastructure for Project Aurora."
+    assert at.text_area[0].value == "Explain the infrastructure for Project Aurora."
+
+    # Verify Beacon example button populates input
+    beacon_btn = [b for b in at.button if "Beacon" in b.label][0]
+    beacon_btn.click().run()
+    assert at.session_state["question_input"] == "What are the key benchmarks in Project Beacon?"
+    assert at.text_area[0].value == "What are the key benchmarks in Project Beacon?"
+
+
+def test_phase3_chat_cards_and_sources_rendering(monkeypatch):
+    """Verify Phase 3 separate user question and assistant answer cards with collapsible sources."""
+    monkeypatch.setenv("APP_ENV", "development")
+    mock_result = {
+        "question": "What database does Project Nexus use?",
+        "answer": "Project Nexus uses ChromaDB as its persistent vector database.",
+        "status": "answered",
+        "missing_information": None,
+        "citations": [{"chunk_id": "nexus_01", "source": "project_nexus.md", "page": 1}],
+        "invalid_citations": [],
+        "citation_disclaimer": "Grounding verified.",
+        "retrieved_evidence": [
+            {
+                "chunk_id": "nexus_01",
+                "text": "Project Nexus utilizes ChromaDB as its persistent vector database.",
+                "source": "project_nexus.md",
+                "page": 1,
+                "chunk_index": 0,
+                "distance": 0.12,
+            }
+        ],
+        "timings": {"retrieval_ms": 15.0, "generation_ms": 120.0, "total_ms": 135.0},
+        "model": "gemini-3.5-flash-lite",
+        "error": None,
+    }
+
+    with patch("src.pipeline.query_pipeline", return_value=mock_result):
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+        at.text_area[0].input("What database does Project Nexus use?")
+        _get_submit_button(at).click().run()
+
+        markdown_all = " ".join([m.value for m in at.markdown])
+
+        # Verify chat cards
+        assert "chat-avatar-user" in markdown_all
+        assert "chat-bubble-user" in markdown_all
+        assert "chat-avatar-assistant" in markdown_all
+        assert "chat-bubble-assistant" in markdown_all
+
+        # Verify answer and collapsible sources
+        assert "Project Nexus uses ChromaDB" in markdown_all
+        assert any("Sources (1)" in e.label for e in at.expander) or "Sources (1)" in markdown_all
+        assert "project_nexus.md" in markdown_all
+        assert "Page 1" in markdown_all
+
+        # Verify recent questions recorded
+        assert "What database does Project Nexus use?" in at.session_state["recent_questions"]
+
+
+def test_answer_and_sources_rendering_with_html_markdown_and_long_identifier(monkeypatch):
+    """Verify that document text containing HTML, Markdown, backticks, and long identifiers
+    renders safely and readably without HTML execution or raw <div class='sources-card'> code blocks."""
+    monkeypatch.setenv("APP_ENV", "development")
+
+    complex_answer = (
+        "Project Nexus uses ChromaDB with `<vector_store_id>`.\n\n"
+        "**Key Architectural Pillars:**\n"
+        "- High throughput: `10,000 qps`\n"
+        "- Strict validation: <script>alert('xss')</script> and <b>bold tag</b> should not execute as HTML.\n"
+    )
+    long_id = "chunk_id_super_long_identifier_without_spaces_abcdefghijklmnopqrstuvwxyz_0123456789_nexus_chunk_001"
+    long_filename = "project_nexus_system_architecture_spec_and_vector_database_design_v2_final.md"
+    passage_with_html = (
+        "Passage snippet containing <div>embedded html</div> and backticks `SELECT * FROM embeddings`."
+    )
+
+    mock_result = {
+        "question": "What is the Nexus architecture?",
+        "answer": complex_answer,
+        "status": "answered",
+        "missing_information": None,
+        "citations": [
+            {
+                "chunk_id": long_id,
+                "source": long_filename,
+                "page": 1,
+            }
+        ],
+        "invalid_citations": [],
+        "citation_disclaimer": "Citations verified from store metadata.",
+        "retrieved_evidence": [
+            {
+                "chunk_id": long_id,
+                "text": passage_with_html,
+                "source": long_filename,
+                "page": 1,
+                "chunk_index": 0,
+                "distance": 0.1122,
+            }
+        ],
+        "timings": {"retrieval_ms": 10.0, "generation_ms": 150.0, "total_ms": 160.0},
+        "model": "gemini-3.5-flash-lite",
+        "error": None,
+    }
+
+    with patch("src.pipeline.query_pipeline", return_value=mock_result):
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+        at.text_area[0].input("What is the Nexus architecture?")
+        _get_submit_button(at).click().run()
+
+        # 1. Verify no raw HTML card code blocks appear
+        markdown_all = " ".join([m.value for m in at.markdown])
+        assert '<div class="sources-card">' not in markdown_all
+        assert '<div class="source-item-row">' not in markdown_all
+        assert '<div class="assistant-answer-text">' not in markdown_all
+
+        # 2. Verify answer rendered safely via safe Streamlit Markdown
+        assert "Project Nexus uses ChromaDB" in markdown_all
+        assert "**Key Architectural Pillars:**" in markdown_all
+
+        # 3. Verify native Sources expander is created
+        sources_expanders = [e for e in at.expander if "Sources" in e.label]
+        assert len(sources_expanders) >= 1
+        assert "Sources (1)" in sources_expanders[0].label
+
+        # 4. Verify long document name, long identifier, and passage are present
+        assert long_filename in markdown_all
+        caption_all = " ".join([c.value for c in at.caption])
+        assert long_id in caption_all or any(long_id in m for m in at.markdown)
+        assert "embedded html" in markdown_all or any("embedded html" in m for m in at.markdown)
+
+
+def test_phase3_sidebar_clear_conversation_clears_history(monkeypatch):
+    """Verify Clear Conversation resets last_result, question_input, and recent_questions."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+    at.session_state["last_result"] = {"question": "q", "answer": "a", "status": "answered"}
+    at.session_state["question_input"] = "seeded query"
+    at.session_state["recent_questions"] = ["q1", "q2"]
+    at.session_state["questions_used"] = 2
+    at.session_state["authenticated"] = False
+    at.run()
+
+    # Click Clear Conversation button
+    clear_btn = [b for b in at.button if "Clear Conversation" in b.label][0]
+    clear_btn.click().run()
+
+    assert at.session_state["last_result"] is None
+    assert at.session_state["question_input"] == ""
+    assert at.session_state["recent_questions"] == []
+    # Quota must be preserved
+    assert at.session_state["questions_used"] == 2
+
+
 def test_example_question_populates_input_without_submitting(monkeypatch):
     """Verify clicking an example button populates question_input without calling pipeline."""
     with patch("src.pipeline.query_pipeline") as mock_pipe:
@@ -756,3 +1026,223 @@ def test_streamlit_timeout_504_rendering_shows_timeout_and_suppresses_answer(mon
         # 4. Abort notice must be present
         info_texts = [i.value for i in at.info]
         assert any("aborted due to request failure" in i for i in info_texts)
+
+
+def test_recent_questions_immediate_sidebar_update_and_error_recording(monkeypatch):
+    """Verify that validated questions (including error returns) are immediately recorded in recent_questions
+    and reflected in the sidebar without stale text, while blank inputs and blocked submissions are not."""
+    monkeypatch.setenv("APP_ENV", "development")
+
+    mock_success = {
+        "question": "What database does Project Nexus use?",
+        "answer": "Project Nexus uses ChromaDB.",
+        "status": "answered",
+        "missing_information": None,
+        "citations": [{"chunk_id": "c1", "source": "nexus.md", "page": 1}],
+        "invalid_citations": [],
+        "retrieved_evidence": [{"chunk_id": "c1", "text": "ChromaDB", "source": "nexus.md", "page": 1}],
+        "timings": {"retrieval_ms": 1.0, "generation_ms": 2.0, "total_ms": 3.0},
+        "model": "gemini-3.5-flash-lite",
+        "error": None,
+    }
+    mock_error = {
+        "question": "Explain Aurora infrastructure",
+        "answer": "",
+        "status": "error",
+        "missing_information": None,
+        "citations": [],
+        "invalid_citations": [],
+        "retrieved_evidence": [],
+        "timings": {"retrieval_ms": 1.0, "generation_ms": 1.0, "total_ms": 2.0},
+        "model": "gemini-3.5-flash-lite",
+        "error": "Backend network failure",
+    }
+
+    with patch("src.pipeline.query_pipeline", side_effect=[mock_success, mock_error]) as mock_pipe:
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+        # 1. First submission (success)
+        at.text_area[0].input("What database does Project Nexus use?")
+        _get_submit_button(at).click().run()
+
+        # History updated immediately with newest first
+        assert at.session_state["recent_questions"][0] == "What database does Project Nexus use?"
+        # Sidebar immediately displays recent question button (not stale text)
+        sidebar_btn_labels = [b.label for b in at.sidebar.button]
+        assert any("What database does Project Nexus use?" in lbl for lbl in sidebar_btn_labels)
+        sidebar_captions = [c.value for c in at.sidebar.caption]
+        assert not any("No recent questions" in cap for cap in sidebar_captions)
+
+        # 2. Second submission (error response from pipeline)
+        at.text_area[0].input("Explain Aurora infrastructure")
+        _get_submit_button(at).click().run()
+
+        # Error response must still be recorded in recent_questions, newest first
+        assert at.session_state["recent_questions"][0] == "Explain Aurora infrastructure"
+        assert at.session_state["recent_questions"][1] == "What database does Project Nexus use?"
+        sidebar_btn_labels = [b.label for b in at.sidebar.button]
+        assert any("Explain Aurora infrastructure" in lbl for lbl in sidebar_btn_labels)
+
+        # 3. Blank submission must NOT be recorded
+        at.text_area[0].input("   ")
+        _get_submit_button(at).click().run()
+        assert len(at.session_state["recent_questions"]) == 2
+
+        # 4. Blocked submission (quota exhausted) must NOT be recorded
+        at.session_state["questions_used"] = 5
+        at.session_state["authenticated"] = False
+        at.text_area[0].input("Blocked question six")
+        _get_submit_button(at).click().run()
+        assert len(at.session_state["recent_questions"]) == 2
+        assert "Blocked question six" not in at.session_state["recent_questions"]
+
+
+def test_recent_questions_selection_and_clearing(monkeypatch):
+    """Verify selecting a recent question populates input without submitting or consuming quota,
+    preserves history on New Conversation, and clears history on Clear Conversation."""
+    monkeypatch.setenv("APP_ENV", "development")
+
+    with patch("src.pipeline.query_pipeline") as mock_pipe:
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+        at.session_state["recent_questions"] = [
+            "Explain Aurora infrastructure",
+            "What database does Project Nexus use?",
+        ]
+        at.session_state["questions_used"] = 2
+        at.run()
+
+        # Find recent question button for Nexus
+        nexus_recent_btn = [b for b in at.sidebar.button if "Nexus" in b.label][0]
+        nexus_recent_btn.click().run()
+
+        # Populates input
+        assert at.session_state["question_input"] == "What database does Project Nexus use?"
+        assert at.text_area[0].value == "What database does Project Nexus use?"
+
+        # Must NOT invoke pipeline or consume quota
+        mock_pipe.assert_not_called()
+        assert at.session_state["questions_used"] == 2
+
+        # New Conversation preserves recent_questions
+        new_conv_btn = [b for b in at.sidebar.button if "New Conversation" in b.label][0]
+        new_conv_btn.click().run()
+        assert at.session_state["question_input"] == ""
+        assert len(at.session_state["recent_questions"]) == 2
+
+        # Clear Conversation clears recent_questions
+        clear_conv_btn = [b for b in at.sidebar.button if "Clear Conversation" in b.label][0]
+        clear_conv_btn.click().run()
+        assert at.session_state["recent_questions"] == []
+
+
+def test_recent_questions_restored_session_state(monkeypatch):
+    """Verify restored session state recovers recent_questions from last_result when uninitialized."""
+    monkeypatch.setenv("APP_ENV", "development")
+    at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+    at.session_state["last_result"] = {
+        "question": "What are the benchmarks in Project Beacon?",
+        "answer": "Beacon benchmarks detail.",
+        "status": "answered",
+        "citations": [],
+        "retrieved_evidence": [],
+    }
+    at.session_state["recent_questions"] = []
+    at.run()
+
+    # Recovers question into recent_questions
+    assert "What are the benchmarks in Project Beacon?" in at.session_state["recent_questions"]
+    sidebar_btn_labels = [b.label for b in at.sidebar.button]
+    assert any("Project Beacon" in lbl for lbl in sidebar_btn_labels)
+
+
+def test_explore_examples_toggle_and_selection(monkeypatch):
+    """Verify Explore examples control expands additional example questions and selecting one
+    populates the input without invoking the pipeline or consuming quota."""
+    monkeypatch.setenv("APP_ENV", "development")
+
+    with patch("src.pipeline.query_pipeline") as mock_pipe:
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+        # Find Explore examples toggle button
+        explore_btn = [b for b in at.button if "Explore examples" in b.label][0]
+        explore_btn.click().run()
+
+        # Expanded state is active
+        assert at.session_state["show_more_examples"] is True
+
+        # Additional example questions are now rendered
+        profile_btn = [b for b in at.button if "Profile" in b.label][0]
+        profile_btn.click().run()
+
+        # Populates question input
+        assert at.session_state["question_input"] == "What is the candidate's background and experience with ML systems?"
+        assert at.text_area[0].value == "What is the candidate's background and experience with ML systems?"
+
+        # Must NOT call pipeline, consume quota, or add to recent_questions
+        mock_pipe.assert_not_called()
+        assert at.session_state["questions_used"] == 0
+        assert at.session_state["recent_questions"] == []
+
+
+def test_recent_questions_interaction_single_call_and_persistent_visibility(monkeypatch):
+    """Regression test: Assert one pipeline invocation, one quota increment, and persistent
+    visible recent-question button after submission, subsequent reruns, and clicking an example."""
+    monkeypatch.setenv("APP_ENV", "development")
+
+    mock_result = {
+        "question": "What database does Project Nexus use?",
+        "answer": "Project Nexus uses ChromaDB.",
+        "status": "answered",
+        "missing_information": None,
+        "citations": [{"chunk_id": "nexus_01", "source": "project_nexus.md", "page": 1}],
+        "invalid_citations": [],
+        "citation_disclaimer": "Verified citations",
+        "retrieved_evidence": [{"chunk_id": "nexus_01", "text": "ChromaDB details", "source": "project_nexus.md", "page": 1}],
+        "timings": {"retrieval_ms": 1.0, "generation_ms": 2.0, "total_ms": 3.0},
+        "model": "gemini-3.5-flash-lite",
+        "error": None,
+    }
+
+    with patch("src.pipeline.query_pipeline", return_value=mock_result) as mock_pipe:
+        at = AppTest.from_file("streamlit_app.py", default_timeout=15).run()
+
+        # Initial fresh session state
+        assert at.session_state["recent_questions"] == []
+        assert any("No recent questions" in c.value for c in at.sidebar.caption)
+
+        # 1. Submit a valid question
+        at.text_area[0].input("What database does Project Nexus use?")
+        _get_submit_button(at).click().run()
+
+        # Exactly 1 pipeline invocation and 1 quota consumed
+        assert mock_pipe.call_count == 1
+        assert at.session_state["questions_used"] == 1
+
+        # Question recorded in recent_questions
+        assert at.session_state["recent_questions"] == ["What database does Project Nexus use?"]
+
+        # Sidebar displays recent question button immediately, and stale caption is gone
+        sidebar_btn_labels = [b.label for b in at.sidebar.button]
+        assert any("What database does Project Nexus use?" in lbl for lbl in sidebar_btn_labels)
+        sidebar_captions = [c.value for c in at.sidebar.caption]
+        assert not any("No recent questions" in cap for cap in sidebar_captions)
+
+        # 2. Subsequent rerun (e.g. user interacts with page or page reruns)
+        at.run()
+
+        # No extra invocation or quota increment
+        assert mock_pipe.call_count == 1
+        assert at.session_state["questions_used"] == 1
+
+        # Recent question button remains visible after rerun
+        sidebar_btn_labels_after_rerun = [b.label for b in at.sidebar.button]
+        assert any("What database does Project Nexus use?" in lbl for lbl in sidebar_btn_labels_after_rerun)
+
+        # 3. Selecting an example button alone does NOT add history or consume quota
+        nexus_example_btn = [b for b in at.button if "Project Nexus" in b.label][0]
+        nexus_example_btn.click().run()
+
+        assert mock_pipe.call_count == 1
+        assert at.session_state["questions_used"] == 1
+        assert at.session_state["recent_questions"] == ["What database does Project Nexus use?"]
+
